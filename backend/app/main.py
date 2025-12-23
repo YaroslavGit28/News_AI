@@ -3,8 +3,9 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .datasources.rss import DEFAULT_SOURCES
@@ -13,12 +14,18 @@ from .services.feed_cache import FeedCache, feed_cache
 from .services.recommender import SimpleRecommender
 from .services.deepseek_client import call_deepseek_api
 from .tasks.ingest import ingest_sources
+from .database import init_db, get_db, get_db_session
+from .models import User, UserFeedback
 
 settings = get_settings()
 app = FastAPI(title="Persona News API")
 recommender = SimpleRecommender()
 cache: FeedCache = feed_cache
-USER_FEEDBACK = defaultdict(lambda: {"likes": set(), "dislikes": set(), "hidden": {}})
+
+# Инициализируем БД при старте приложения
+@app.on_event("startup")
+def startup_event():
+    init_db()
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,13 +55,6 @@ def _get_article(article_id: int) -> Article | None:
     return None
 
 
-def _cleanup_hidden(user_id: str) -> dict[int, datetime]:
-    prefs = USER_FEEDBACK[user_id]
-    hidden: dict[int, datetime] = prefs["hidden"]
-    now = datetime.utcnow()
-    valid = {aid: ts for aid, ts in hidden.items() if now - ts < timedelta(hours=1)}
-    USER_FEEDBACK[user_id]["hidden"] = valid
-    return valid
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
@@ -82,19 +82,32 @@ def list_sources() -> list[Source]:
 def get_feed(
     user_id: str = Query(default="demo"),
     limit: int = Query(default=25, ge=1, le=100),
+    db: Session = Depends(get_db),
 ) -> RecommendationResponse:
+    # Создаем пользователя, если его нет
+    get_or_create_user(db, user_id)
+    
     articles = cache.get_articles()
-    hidden = _cleanup_hidden(user_id)
+    hidden = _cleanup_hidden(db, user_id)
     visible_articles = [article for article in articles if article.id not in hidden]
     personalized = recommender.recommend(user_id=user_id, articles=visible_articles)
+    
+    # Получаем информацию о скрытых статьях из БД
+    hidden_feedbacks = db.query(UserFeedback).filter(
+        UserFeedback.user_id == user_id,
+        UserFeedback.action == "hide"
+    ).all()
+    
     hidden_info = [
         HiddenArticleInfo(
-            article_id=aid,
-            hidden_at=ts,
-            expires_at=ts + timedelta(hours=1),
+            article_id=fb.article_id,
+            hidden_at=fb.created_at,
+            expires_at=fb.expires_at or (fb.created_at + timedelta(hours=1)),
         )
-        for aid, ts in hidden.items()
+        for fb in hidden_feedbacks
+        if not fb.expires_at or fb.expires_at > datetime.utcnow()
     ]
+    
     return RecommendationResponse(
         user_id=user_id,
         generated_at=datetime.utcnow(),
@@ -114,35 +127,83 @@ def submit_feedback(
     article_id: int = Query(...),
     user_id: str = Query(default="demo"),
     action: str = Query(..., description="like, dislike, hide, undo_hide"),
+    db: Session = Depends(get_db),
 ) -> dict:
     """Обратная связь от пользователя для улучшения рекомендаций"""
     if action not in ["like", "dislike", "hide", "undo_hide"]:
         raise HTTPException(status_code=400, detail="Invalid action. Use: like, dislike, hide, undo_hide")
 
-    prefs = USER_FEEDBACK[user_id]
+    # Создаем пользователя, если его нет
+    user = get_or_create_user(db, user_id)
     article = _get_article(article_id)
 
     if action in {"like", "dislike"} and not article:
         raise HTTPException(status_code=404, detail="Article not found for feedback")
 
     message = "ok"
+    
     if action == "like":
+        # Удаляем старые feedback для этой статьи
+        db.query(UserFeedback).filter(
+            UserFeedback.user_id == user_id,
+            UserFeedback.article_id == article_id
+        ).delete()
+        
+        # Добавляем новый like
+        feedback = UserFeedback(
+            user_id=user_id,
+            article_id=article_id,
+            action="like"
+        )
+        db.add(feedback)
         recommender.add_feedback(user_id, article, value=1)
-        prefs["likes"].add(article_id)
-        prefs["dislikes"].discard(article_id)
         message = "liked"
+        
     elif action == "dislike":
+        # Удаляем старые feedback для этой статьи
+        db.query(UserFeedback).filter(
+            UserFeedback.user_id == user_id,
+            UserFeedback.article_id == article_id
+        ).delete()
+        
+        # Добавляем новый dislike
+        feedback = UserFeedback(
+            user_id=user_id,
+            article_id=article_id,
+            action="dislike"
+        )
+        db.add(feedback)
         recommender.add_feedback(user_id, article, value=-1)
-        prefs["dislikes"].add(article_id)
-        prefs["likes"].discard(article_id)
         message = "disliked"
+        
     elif action == "hide":
-        prefs["hidden"][article_id] = datetime.utcnow()
+        # Проверяем, не скрыта ли уже статья
+        existing = db.query(UserFeedback).filter(
+            UserFeedback.user_id == user_id,
+            UserFeedback.article_id == article_id,
+            UserFeedback.action == "hide"
+        ).first()
+        
+        if not existing:
+            feedback = UserFeedback(
+                user_id=user_id,
+                article_id=article_id,
+                action="hide",
+                expires_at=datetime.utcnow() + timedelta(hours=1)
+            )
+            db.add(feedback)
         message = "hidden"
+        
     elif action == "undo_hide":
-        removed = prefs["hidden"].pop(article_id, None)
-        message = "restored" if removed else "not_hidden"
+        # Удаляем скрытие
+        removed = db.query(UserFeedback).filter(
+            UserFeedback.user_id == user_id,
+            UserFeedback.article_id == article_id,
+            UserFeedback.action == "hide"
+        ).delete()
+        message = "restored" if removed > 0 else "not_hidden"
 
+    db.commit()
     return {"status": "success", "message": message, "user_id": user_id}
 
 

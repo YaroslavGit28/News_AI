@@ -58,6 +58,7 @@ dist/
 *.sqlite
 *.sqlite3
 news.db
+backend/news.db
 
 # OS
 Thumbs.db

@@ -10,7 +10,7 @@ load_dotenv()
 class Settings(BaseModel):
     app_name: str = Field(default="Persona News API")
     environment: str = Field(default=os.getenv("ENV", "development"))
-    database_url: str = Field(default=os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./news.db"))
+    database_url: str = Field(default=os.getenv("DATABASE_URL", "sqlite:///./news.db"))
     redis_url: str = Field(default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     openai_api_key: str | None = Field(default=os.getenv("OPENAI_API_KEY"))
     deepseek_api_key: str | None = Field(default=os.getenv("DEEPSEEK_API_KEY"))
