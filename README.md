@@ -1,5 +1,5 @@
 # Persona News — Персональный агрегатор новостей
-**База знаний - ** https://www.notion.so/Persona-News-2caa1fb10f1480c89128ca6f50e7ec2f
+**База знаний -** https://www.notion.so/Persona-News-2caa1fb10f1480c89128ca6f50e7ec2f
 
 **Проблема:** информационная перегрузка и отсутствие структуры в лентах.
 
