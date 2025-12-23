@@ -74,8 +74,6 @@ npm run dev
 - **AI**: Локальная логика анализа и классификации новостей
 - **Источники**: RSS фиды из 20+ источников
 
-## GitHub
 
-Репозиторий: [https://github.com/YaroslavGit28/News_AI](https://github.com/YaroslavGit28/News_AI)
 
-Документация и дальнейшие шаги — в каталоге `docs/`.
+
